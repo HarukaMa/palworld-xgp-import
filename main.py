@@ -1,30 +1,60 @@
 import datetime
-import io
-import re
 import os
+import re
 import shutil
 import sys
 import uuid
-from typing import BinaryIO
+from sys import exit
 
 from container_types import ContainerIndex, NotSupportedError, ContainerFile, ContainerFileList, FILETIME, Container
-from savefile_types import SaveFile
 
+
+def add_container(container_index: ContainerIndex, source_save_path: str, save_filename: str, container_name: str,
+                  container_path: str):
+    # 4.1 create container file list
+    files = [
+        ContainerFile("Data", uuid.uuid4(), open(save_filename, "rb").read()),
+    ]
+    container_file_list = ContainerFileList(seq=1, files=files)
+
+    # 4.2 create container index entry
+    container_uuid = uuid.uuid4()
+    mtime = FILETIME.from_timestamp(os.path.getmtime(source_save_path))
+    size = os.path.getsize(save_filename)
+    container = Container(
+        container_name=container_name,
+        cloud_id="",
+        seq=1,
+        flag=5,
+        container_uuid=container_uuid,
+        mtime=mtime,
+        size=size,
+    )
+
+    # 4.3 add new container to container index
+    container_index.containers.append(container)
+    container_index.mtime = FILETIME.from_timestamp(datetime.datetime.now().timestamp())
+
+    # 4.5 write container file list
+    container_content_path = os.path.join(container_path, container_uuid.bytes_le.hex().upper())
+    os.makedirs(container_content_path, exist_ok=True)
+    container_file_list.write_container(container_content_path)
+    print(f"Wrote new container to {container_content_path}")
 
 def main():
     if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <save_file>")
+        print(f"Usage: {sys.argv[0]} <save_folder>")
         os.system("pause")
         exit(1)
 
-    print("========== Starfield Save File Importer v0.0.5 ==========")
+    print("========== Palworld Save File Importer v0.0.1 ==========")
     print("WARNING: This tool is experimental. Always manually back up your existing saves!")
     print()
 
     # 1. find the container
-    package_path = os.path.expandvars(r"%LOCALAPPDATA%\Packages\BethesdaSoftworks.ProjectGold_3275kfvn8vcwc")
+    package_path = os.path.expandvars(r"%LOCALAPPDATA%\Packages\PocketpairInc.Palworld_ad4psfrxyesvt")
     if not os.path.exists(package_path):
-        print("Error: Could not find the package path. Make sure you have Xbox Starfield installed.")
+        print("Error: Could not find the package path. Make sure you have Xbox Palworld installed.")
         os.system("pause")
         exit(2)
     wgs_path = os.path.join(package_path, "SystemAppData", "wgs")
@@ -56,69 +86,61 @@ def main():
     print(f"  {len(container_index.containers)} containers:")
     for container in container_index.containers:
         print(f"    {container.container_name} ({container.size} bytes)")
+        c = os.path.join(container_path, container.container_uuid.bytes_le.hex().upper())
+        for f in os.listdir(c):
+            if f.startswith("container."):
+                file_list = ContainerFileList.from_stream(open(os.path.join(c, f), "rb"))
+                for file in file_list.files:
+                    print(f"      {file.name}")
     print()
 
-    # 3. read the source save file
-    source_save_path = sys.argv[1]
+    # 3. check the source save folders
+    source_save_path = os.path.normpath(sys.argv[1])
     if not os.path.exists(source_save_path):
-        print(f"Error: Source save file does not exist: {source_save_path}")
+        print(f"Error: Source save path does not exist: {source_save_path}")
         os.system("pause")
         exit(4)
-    source_save_file = open(source_save_path, "rb")
-    save_file = SaveFile.from_stream(source_save_file)
-    source_save_file.close()
-    print("Parsed save file:")
-    print(f"  Filename: {save_file.filename}")
-    print(f"  Uncompressed size: {save_file.uncompressed_size} bytes")
-    print(f"  {len(save_file.chunks)} chunks")
+    if os.path.isfile(source_save_path):
+        # if user provided a file inside it, use the parent folder
+        source_save_path = os.path.dirname(source_save_path)
+    # check if this is really a palworld save folder
+    if not os.path.exists(os.path.join(source_save_path, "level.sav")):
+        print(f"Error: Source save folder doesn't seem like a Palworld save folder: {source_save_path}")
+        os.system("pause")
+        exit(4)
+    save_name = os.path.basename(source_save_path)
+    print("Save file:")
+    print(f"  Folder: {source_save_path}")
     print()
 
     # 3.2 check if the save file already exists
     for container in container_index.containers:
-        if container.container_name == f"Saves/{save_file.filename}":
+        if container.container_name == f"{save_name}-Level":
             print(f"Error: Save file already exists: {container.container_name}")
             os.system("pause")
             exit(5)
 
     # 4. create a new container
-    # 4.1 create container file list
-    print("Creating new container")
-    files = [
-        ContainerFile("BETHESDAPFH", uuid.uuid4(), save_file.header_bytes()),
-    ]
-    for index, chunk in enumerate(save_file.chunks):
-        files.append(ContainerFile(f"P{index}P", uuid.uuid4(), chunk.data))
-    container_file_list = ContainerFileList(seq=1, files=files)
 
-    # 4.2 create container index entry
-    container_name = f"Saves/{save_file.filename}"
-    container_uuid = uuid.uuid4()
-    mtime = FILETIME.from_timestamp(os.path.getmtime(source_save_path))
-    size = save_file.real_header_size + sum(chunk.size for chunk in save_file.chunks)
-    container = Container(
-        container_name=container_name,
-        cloud_id="",
-        seq=1,
-        flag=5,
-        container_uuid=container_uuid,
-        mtime=mtime,
-        size=size,
-    )
-
-    # 4.3 add new container to container index
-    container_index.containers.append(container)
-    container_index.mtime = FILETIME.from_timestamp(datetime.datetime.now().timestamp())
-
-    # 4.4 cowardly creating a backup of the container
+    # 4.1 cowardly creating a backup of the container
     container_backup_path = os.path.join(container_path, f"{container_path}.backup.{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}")
     shutil.copytree(container_path, container_backup_path)
     print(f"Created backup of container: {container_backup_path}")
 
-    # 4.5 write container file list
-    container_content_path = os.path.join(container_path, container_uuid.bytes_le.hex().upper())
-    os.makedirs(container_content_path, exist_ok=True)
-    container_file_list.write_container(container_content_path)
-    print(f"Wrote new container to {container_content_path}")
+    print("Creating new containers")
+    save_file_list = [
+        "Level",
+        "LevelMeta",
+        "LocalData",
+        "WorldOption"
+    ]
+    for save_file in save_file_list:
+        filename = os.path.join(source_save_path, f"{save_file}.sav")
+        add_container(container_index, source_save_path, filename, f"{save_name}-{save_file}", container_path)
+    player_path = os.path.join(source_save_path, "Players")
+    for save_file in os.listdir(player_path):
+        filename = os.path.join(player_path, save_file)
+        add_container(container_index, source_save_path, filename, f"{save_name}-Players-{save_file.replace('.sav', '')}", container_path)
 
     # 4.6 write container index
     container_index.write_file(container_path)
